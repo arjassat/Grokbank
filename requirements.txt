@@ -1,0 +1,5 @@
+streamlit
+pandas
+pdf2image
+groq
+pillow
