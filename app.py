@@ -2,58 +2,60 @@ import streamlit as st
 import pandas as pd
 from pdf2image import convert_from_bytes
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import re
-from datetime import datetime
 import io
 
-st.set_page_config(page_title="Standard Bank Statement OCR", layout="wide")
-st.title("📄 Standard Bank Statement to CSV Converter")
-st.markdown("Upload your scanned Standard Bank PDF statements (2022-2026 format).")
+st.set_page_config(page_title="Standard Bank OCR", layout="wide")
+st.title("📄 Standard Bank Statement to CSV")
+st.caption("Scanned PDFs → Clean CSV for budget apps")
 
-uploaded_files = st.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload Standard Bank PDF statement(s)", type="pdf", accept_multiple_files=True)
+
+def preprocess_image(image):
+    """Improve OCR quality"""
+    gray = image.convert('L')
+    enhancer = ImageEnhance.Contrast(gray)
+    enhanced = enhancer.enhance(2.0)
+    enhanced = enhanced.filter(ImageFilter.MedianFilter())
+    return enhanced
 
 def parse_standard_bank_text(text):
     transactions = []
-    lines = text.split('\n')
-    
-    date_pattern = r'(\d{2})\s*(\d{2})\s*(\d{4}|\d{2})'  # Handles various date formats in OCR
-    amount_pattern = r'([\d,]+\.?\d*)-?'  # Amounts with possible minus
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
     
     current_date = None
     
     for line in lines:
-        line = line.strip()
-        if not line or len(line) < 5:
-            continue
-            
-        # Look for date in DD MM or similar (common in statements)
+        # Extract date (common formats in your statements)
         date_match = re.search(r'(\d{2})\s*(\d{2})\s*(?:20)?(\d{2})', line)
         if date_match:
             try:
-                dd = date_match.group(1)
-                mm = date_match.group(2)
-                yy = date_match.group(3)
+                dd, mm, yy = date_match.groups()
                 if len(yy) == 2:
                     yy = '20' + yy
                 current_date = f"{dd}/{mm}/{yy}"
             except:
                 pass
         
-        # Look for debit/credit lines with amounts
-        if any(keyword in line.upper() for keyword in ['DEBIT CARD', 'CASH DEPOSIT', 'PAYMENT', 'PURCHASE', 'TRANSFER', 'WITHDRAWAL', 'FEE']):
-            # Extract description and amount
-            desc = line[:100]  # Truncate long desc
-            # Find amounts
-            amounts = re.findall(r'([\d,]+\.\d{2})-?', line)
+        # Look for transaction lines with amounts
+        if re.search(r'\d{1,3}(?:,\d{3})*\.\d{2}', line):
+            # Extract amount (last number in line)
+            amounts = re.findall(r'([\d,]+\.\d{2})', line)
             if amounts:
                 amt_str = amounts[-1].replace(',', '')
                 try:
                     amt = float(amt_str)
-                    # Debit if - or typical debit keywords
-                    if '-' in line or any(k in line.upper() for k in ['PURCHASE', 'FEE', 'WITHDRAWAL']):
+                    
+                    # Determine debit/credit
+                    line_upper = line.upper()
+                    if any(word in line_upper for word in ['PURCHASE', 'FEE', 'WITHDRAWAL', 'DEBIT', 'PAYMENT']):
                         amt = -amt
-                    if current_date:
+                    
+                    # Description
+                    desc = line[:120].strip()
+                    
+                    if current_date and abs(amt) > 0.01:
                         transactions.append({
                             'date': current_date,
                             'description': desc,
@@ -61,63 +63,48 @@ def parse_standard_bank_text(text):
                         })
                 except:
                     pass
-    
     return transactions
 
 if uploaded_files:
     all_transactions = []
-    
     progress_bar = st.progress(0)
+    
     for idx, uploaded_file in enumerate(uploaded_files):
-        st.info(f"Processing {uploaded_file.name}...")
+        st.info(f"Processing: {uploaded_file.name}")
         
-        # Convert PDF to images
-        images = convert_from_bytes(uploaded_file.read())
+        try:
+            images = convert_from_bytes(uploaded_file.read(), dpi=300)
+            
+            for page_num, img in enumerate(images):
+                processed_img = preprocess_image(img)
+                text = pytesseract.image_to_string(processed_img, config='--psm 6')
+                txns = parse_standard_bank_text(text)
+                all_transactions.extend(txns)
+                
+        except Exception as e:
+            st.error(f"Error processing {uploaded_file.name}: {str(e)}")
         
-        for page_num, image in enumerate(images):
-            # OCR
-            text = pytesseract.image_to_string(image, config='--psm 6')
-            
-            # Parse
-            txns = parse_standard_bank_text(text)
-            all_transactions.extend(txns)
-            
-            progress_bar.progress((idx + 1) / len(uploaded_files))
+        progress_bar.progress((idx + 1) / len(uploaded_files))
     
     if all_transactions:
         df = pd.DataFrame(all_transactions)
-        # Clean up duplicates / sort
-        df = df.drop_duplicates().sort_values('date')
+        df = df.drop_duplicates().sort_values('date').reset_index(drop=True)
         
-        st.success(f"Extracted {len(df)} transactions!")
+        st.success(f"✅ Extracted **{len(df)}** transactions successfully!")
+        st.dataframe(df.head(30), use_container_width=True)
         
-        # Preview
-        st.dataframe(df.head(20))
-        
-        # Download CSV
+        # CSV Download
         csv = df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv,
-            file_name="bank_transactions.csv",
-            mime="text/csv"
-        )
+        st.download_button("📥 Download CSV", csv, "bank_transactions.csv", "text/csv")
         
-        # Optional: Excel too
+        # Excel Download
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False)
-        st.download_button(
-            label="📥 Download Excel",
-            data=output.getvalue(),
-            file_name="bank_transactions.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            df.to_excel(writer, index=False, sheet_name='Transactions')
+        st.download_button("📥 Download Excel", output.getvalue(), "bank_transactions.xlsx", 
+                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else:
-        st.warning("No transactions found. Try improving scan quality or contact for parser tweaks.")
+        st.warning("No transactions found. Try higher quality scans.")
 
 st.markdown("---")
-st.info("**Tips for best results:**\n"
-        "- Use clear, high-contrast scans.\n"
-        "- One statement per PDF is ideal but multiple works.\n"
-        "- The parser is tuned specifically for Standard Bank layout.")
+st.info("**Tips:** High-contrast scans work best. The app is tuned specifically for Standard Bank statements like the one you shared.")
