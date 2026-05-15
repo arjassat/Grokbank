@@ -1,110 +1,127 @@
 import streamlit as st
 import pandas as pd
 from pdf2image import convert_from_bytes
-import pytesseract
 from PIL import Image, ImageEnhance, ImageFilter
+import pytesseract
 import re
 import io
+from datetime import datetime
 
 st.set_page_config(page_title="Standard Bank OCR", layout="wide")
-st.title("📄 Standard Bank Statement to CSV")
-st.caption("Scanned PDFs → Clean CSV for budget apps")
+st.title("📄 Standard Bank Statement → Clean CSV")
+st.caption("Improved parser for 2022-2026 statements")
 
-uploaded_files = st.file_uploader("Upload Standard Bank PDF statement(s)", type="pdf", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
 
 def preprocess_image(image):
-    """Improve OCR quality"""
     gray = image.convert('L')
     enhancer = ImageEnhance.Contrast(gray)
-    enhanced = enhancer.enhance(2.0)
-    enhanced = enhanced.filter(ImageFilter.MedianFilter())
+    enhanced = enhancer.enhance(2.5)
+    enhanced = enhanced.filter(ImageFilter.MedianFilter(size=3))
     return enhanced
 
-def parse_standard_bank_text(text):
+def extract_transactions_from_text(text):
     transactions = []
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    lines = text.split('\n')
     
     current_date = None
+    balance_pattern = re.compile(r'(\d{1,3}(?:,\d{3})*\.\d{2})')
     
     for line in lines:
-        # Extract date (common formats in your statements)
+        line = line.strip()
+        if not line or len(line) < 10:
+            continue
+        
+        # === DATE DETECTION (DD MM) ===
         date_match = re.search(r'(\d{2})\s*(\d{2})\s*(?:20)?(\d{2})', line)
         if date_match:
-            try:
-                dd, mm, yy = date_match.groups()
-                if len(yy) == 2:
-                    yy = '20' + yy
-                current_date = f"{dd}/{mm}/{yy}"
-            except:
-                pass
+            dd, mm, yy = date_match.groups()
+            if len(yy) == 2 and int(mm) <= 12 and int(dd) <= 31:
+                current_date = f"{dd}/{mm}/20{yy}"
         
-        # Look for transaction lines with amounts
-        if re.search(r'\d{1,3}(?:,\d{3})*\.\d{2}', line):
-            # Extract amount (last number in line)
-            amounts = re.findall(r'([\d,]+\.\d{2})', line)
-            if amounts:
-                amt_str = amounts[-1].replace(',', '')
-                try:
-                    amt = float(amt_str)
-                    
-                    # Determine debit/credit
-                    line_upper = line.upper()
-                    if any(word in line_upper for word in ['PURCHASE', 'FEE', 'WITHDRAWAL', 'DEBIT', 'PAYMENT']):
-                        amt = -amt
-                    
-                    # Description
-                    desc = line[:120].strip()
-                    
-                    if current_date and abs(amt) > 0.01:
-                        transactions.append({
-                            'date': current_date,
-                            'description': desc,
-                            'amount': amt
-                        })
-                except:
-                    pass
+        # === AMOUNT DETECTION ===
+        amounts = re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', line)
+        if not amounts:
+            continue
+        
+        # Take the last realistic amount (usually the transaction amount)
+        amt_str = amounts[-1].replace(',', '')
+        try:
+            amount = float(amt_str)
+            if amount < 1:  # skip tiny numbers that are fees sometimes misread
+                continue
+        except:
+            continue
+        
+        # Determine if Debit or Credit
+        line_upper = line.upper()
+        is_debit = False
+        
+        debit_keywords = ['PURCHASE', 'FEE', 'WITHDRAWAL', 'PAYMENT TO', 'DEBIT CARD', 'PRE-PAID']
+        credit_keywords = ['DEPOSIT', 'CREDIT', 'TRANSFER FROM', 'MAGTAPE', 'REAL TIME TRANSFER']
+        
+        if any(kw in line_upper for kw in debit_keywords):
+            is_debit = True
+        elif any(kw in line_upper for kw in credit_keywords):
+            is_debit = False
+        else:
+            # fallback: look for "-" near the amount
+            if '-' in line[-30:]:  
+                is_debit = True
+        
+        if is_debit:
+            amount = -amount
+        
+        # Clean description
+        desc = re.sub(r'\s+', ' ', line[:150]).strip()
+        desc = re.sub(r'(\d{1,3}(?:,\d{3})*\.\d{2})', '', desc).strip()  # remove amounts from desc
+        
+        if current_date and len(desc) > 5:
+            transactions.append({
+                'date': current_date,
+                'description': desc,
+                'amount': round(amount, 2)
+            })
+    
     return transactions
 
 if uploaded_files:
-    all_transactions = []
-    progress_bar = st.progress(0)
+    all_txns = []
+    progress = st.progress(0)
     
-    for idx, uploaded_file in enumerate(uploaded_files):
-        st.info(f"Processing: {uploaded_file.name}")
-        
+    for i, file in enumerate(uploaded_files):
+        st.info(f"Processing {file.name}...")
         try:
-            images = convert_from_bytes(uploaded_file.read(), dpi=300)
+            images = convert_from_bytes(file.read(), dpi=350)  # higher DPI for better OCR
             
-            for page_num, img in enumerate(images):
-                processed_img = preprocess_image(img)
-                text = pytesseract.image_to_string(processed_img, config='--psm 6')
-                txns = parse_standard_bank_text(text)
-                all_transactions.extend(txns)
+            for page in images:
+                processed = preprocess_image(page)
+                text = pytesseract.image_to_string(processed, config='--psm 6 -c tessedit_char_blacklist=|')
+                txns = extract_transactions_from_text(text)
+                all_txns.extend(txns)
                 
         except Exception as e:
-            st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+            st.error(f"Failed on {file.name}: {e}")
         
-        progress_bar.progress((idx + 1) / len(uploaded_files))
+        progress.progress((i+1)/len(uploaded_files))
     
-    if all_transactions:
-        df = pd.DataFrame(all_transactions)
-        df = df.drop_duplicates().sort_values('date').reset_index(drop=True)
+    if all_txns:
+        df = pd.DataFrame(all_txns)
+        df = df.drop_duplicates(subset=['date', 'description', 'amount']).sort_values('date')
         
-        st.success(f"✅ Extracted **{len(df)}** transactions successfully!")
-        st.dataframe(df.head(30), use_container_width=True)
+        st.success(f"✅ Extracted **{len(df)}** transactions!")
+        st.dataframe(df.head(50), use_container_width=True)
         
-        # CSV Download
         csv = df.to_csv(index=False)
-        st.download_button("📥 Download CSV", csv, "bank_transactions.csv", "text/csv")
+        st.download_button("📥 Download CSV", csv, "standard_bank_clean.csv", "text/csv")
         
-        # Excel Download
+        # Excel too
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Transactions')
-        st.download_button("📥 Download Excel", output.getvalue(), "bank_transactions.xlsx", 
+            df.to_excel(writer, index=False)
+        st.download_button("📥 Download Excel", output.getvalue(), "standard_bank_clean.xlsx", 
                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else:
-        st.warning("No transactions found. Try higher quality scans.")
+        st.error("Nothing extracted. Please try a clearer scan.")
 
-st.markdown("---")
-st.info("**Tips:** High-contrast scans work best. The app is tuned specifically for Standard Bank statements like the one you shared.")
+st.info("**New version** — stronger date detection, better debit/credit logic, cleaner descriptions.")
